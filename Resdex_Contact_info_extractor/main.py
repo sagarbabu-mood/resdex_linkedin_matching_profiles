@@ -3,7 +3,8 @@ import streamlit as st
 from fuzzywuzzy import fuzz, process
 import re
 import string
-
+from sentence_transformers import SentenceTransformer
+import numpy as np
 
 def preprocess_name(name):
     """
@@ -14,7 +15,6 @@ def preprocess_name(name):
         return ""
     translator = str.maketrans("", "", string.punctuation)
     return name.translate(translator).lower().strip()
-
 
 def extract_experiences(linkedin_row):
     """
@@ -57,7 +57,6 @@ def extract_experiences(linkedin_row):
 
     return experiences
 
-
 def extract_educations(linkedin_row):
     """
     Dynamically extracts all education details from the LinkedIn row.
@@ -76,91 +75,79 @@ def extract_educations(linkedin_row):
 
     return educations
 
-
-# def match_candidates(linkedin_df, naukri_df, selected_health):
-#     """
-#     Matches candidates from LinkedIn and Naukri data based on multiple criteria.
-#     Parameters:
-#         linkedin_df (DataFrame): LinkedIn profiles
-#         naukri_df (DataFrame): Naukri profiles
-#         selected_health (str): Profile health filter (High, Medium, Low)
-#     Returns:
-#         DataFrame: Matched candidates
-#     """
-#     linkedin_filtered = linkedin_df[linkedin_df["Profile Health"] == selected_health]
-#     linkedin_filtered = linkedin_filtered.copy()
-
-#     # Process experiences and educations dynamically
-#     linkedin_filtered["Experiences"] = linkedin_filtered.apply(extract_experiences, axis=1)
-#     linkedin_filtered["Educations"] = linkedin_filtered.apply(extract_educations, axis=1)
-#     linkedin_filtered["Processed Name"] = linkedin_filtered["Candidate Name"].apply(preprocess_name)
-
-#     naukri_df["Processed Name"] = naukri_df["Candidate Name"].apply(preprocess_name)
-
-#     linkedin_names = linkedin_filtered["Processed Name"].tolist()
-
-#     matches = []
-#     for _, naukri_row in naukri_df.iterrows():
-#         naukri_name = naukri_row["Processed Name"]
-#         if not naukri_name:
-#             continue  # Skip if no name
-
-#         # Fuzzy match
-#         match, score = process.extractOne(naukri_name, linkedin_names, scorer=fuzz.token_sort_ratio)
-#         if match and score >= 85:
-#             matched_row = linkedin_filtered[linkedin_filtered["Processed Name"] == match].iloc[0]
-#             combined_profile = {**matched_row.to_dict(), **naukri_row.to_dict()}
-#             matches.append(combined_profile)
-
-#     return pd.DataFrame(matches)
-
-def match_candidates(linkedin_df, naukri_df, selected_health):
+def get_profile_embedding(profile_data):
     """
-    Matches candidates from LinkedIn and Naukri data based on multiple criteria.
-    Parameters:
-        linkedin_df (DataFrame): LinkedIn profiles
-        naukri_df (DataFrame): Naukri profiles
-        selected_health (str): Profile health filter (High, Medium, Low)
-    Returns:
-        DataFrame: Matched candidates
+    Creates an embedding for a candidate's profile by combining relevant information.
     """
-    linkedin_filtered = linkedin_df[linkedin_df["Profile Health"] == selected_health]
+    # Combine relevant profile information
+    profile_text = f"{profile_data['Candidate Name']} "
+    
+    # Add experience information
+    if isinstance(profile_data.get('Experiences'), list):
+        for exp in profile_data['Experiences']:
+            profile_text += f"{exp.get('Current Employer', '')} {exp.get('Designation', '')} "
+    
+    # Add education information
+    if isinstance(profile_data.get('Educations'), list):
+        for edu in profile_data['Educations']:
+            profile_text += f"{edu.get('Education Details', '')} "
+    
+    return profile_text.strip()
 
-    # If no LinkedIn profiles match the selected health, return an empty DataFrame
+def match_candidates(linkedin_df, naukri_df, selected_health, similarity_threshold=0.85):
+    """
+    Matches candidates using AI embeddings for better accuracy.
+    """
+    linkedin_filtered = linkedin_df[linkedin_df["Profile Health"] == selected_health].copy()
+    
     if linkedin_filtered.empty:
         return pd.DataFrame()
 
-    linkedin_filtered = linkedin_filtered.copy()
-
-    # Process experiences and educations dynamically
+    # Initialize the sentence transformer model
+    model = SentenceTransformer('all-MiniLM-L6-v2')
+    
+    # Process experiences and educations
     linkedin_filtered["Experiences"] = linkedin_filtered.apply(extract_experiences, axis=1)
     linkedin_filtered["Educations"] = linkedin_filtered.apply(extract_educations, axis=1)
-    linkedin_filtered["Processed Name"] = linkedin_filtered["Candidate Name"].apply(preprocess_name)
-
-    naukri_df["Processed Name"] = naukri_df["Candidate Name"].apply(preprocess_name)
-
-    linkedin_names = linkedin_filtered["Processed Name"].tolist()
-
-    # If linkedin_names is empty, return an empty DataFrame
-    if not linkedin_names:
-        return pd.DataFrame()
-
+    
+    # Create embeddings for LinkedIn profiles
+    linkedin_texts = linkedin_filtered.apply(get_profile_embedding, axis=1).tolist()
+    linkedin_embeddings = model.encode(linkedin_texts, convert_to_tensor=True)
+    
     matches = []
-    for _, naukri_row in naukri_df.iterrows():
-        naukri_name = naukri_row["Processed Name"]
-        if not naukri_name:
-            continue  # Skip if no name
-
-        # Fuzzy match
-        match_result = process.extractOne(naukri_name, linkedin_names, scorer=fuzz.token_sort_ratio)
-        if match_result is not None:
-            match, score = match_result
-            if score >= 85:
-                matched_row = linkedin_filtered[linkedin_filtered["Processed Name"] == match].iloc[0]
-                combined_profile = {**matched_row.to_dict(), **naukri_row.to_dict()}
+    
+    # Process Naukri profiles in batches
+    batch_size = 32
+    for i in range(0, len(naukri_df), batch_size):
+        batch = naukri_df.iloc[i:i+batch_size]
+        
+        # Create embeddings for Naukri profiles
+        naukri_texts = batch.apply(get_profile_embedding, axis=1).tolist()
+        naukri_embeddings = model.encode(naukri_texts, convert_to_tensor=True)
+        
+        # Calculate similarity scores
+        similarity_scores = np.inner(naukri_embeddings, linkedin_embeddings)
+        
+        # Find matches above threshold
+        for idx, scores in enumerate(similarity_scores):
+            max_score = np.max(scores)
+            if max_score >= similarity_threshold:
+                linkedin_idx = np.argmax(scores)
+                naukri_row = batch.iloc[idx]
+                linkedin_row = linkedin_filtered.iloc[linkedin_idx]
+                
+                combined_profile = {
+                    **linkedin_row.to_dict(),
+                    **naukri_row.to_dict(),
+                    'Match_Score': float(max_score)
+                }
                 matches.append(combined_profile)
-
-    return pd.DataFrame(matches)
+    
+    matched_df = pd.DataFrame(matches)
+    if not matched_df.empty:
+        matched_df = matched_df.sort_values('Match_Score', ascending=False)
+    
+    return matched_df
 
 def main():
     st.title("Dynamic Candidate Matching App")
