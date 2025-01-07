@@ -76,7 +76,7 @@ def extract_experiences(linkedin_row):
             "Current Employer": "",
             "Designation": "",
             "Experience": 0.0,
-            "Location": "",
+            "Location": ""
             "Experience": "",
             "Location": "",
         }
